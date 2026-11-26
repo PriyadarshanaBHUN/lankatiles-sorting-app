@@ -1673,6 +1673,8 @@
                 appData = cloneSeedData();
             }
 
+            normalizeAppData();
+
             try {
                 const rawQueue = localStorage.getItem(STORAGE_QUEUE_KEY);
                 syncQueue = rawQueue ? JSON.parse(rawQueue) : [];
@@ -2236,6 +2238,7 @@
                 if (Array.isArray(data.activityLogs))
                     appData.activityLogs = data.activityLogs;
 
+                normalizeAppData();
                 persistLocalState();
                 if (typeof finalizeAppInit === "function") finalizeAppInit();
                 if (showOkToast) showToast("Synced with cloud database", "success");
@@ -2448,18 +2451,23 @@
         }
 
         function matchesDateAndPeriod(dateStr, periodVal, fromDateStr, toDateStr) {
-            if (fromDateStr && (!dateStr || dateStr < fromDateStr)) return false;
-            if (toDateStr && (!dateStr || dateStr > toDateStr)) return false;
+            const normDate = normalizeDateValue(dateStr);
+            const normFrom = normalizeDateValue(fromDateStr);
+            const normTo = normalizeDateValue(toDateStr);
 
-            if (!fromDateStr && !toDateStr && periodVal && periodVal !== "all" && periodVal !== "custom") {
-                if (!dateStr) return false;
-                const pDate = new Date(dateStr + "T00:00:00");
+            if (normFrom && (!normDate || normDate < normFrom)) return false;
+            if (normTo && (!normDate || normDate > normTo)) return false;
+
+            if (!normFrom && !normTo && periodVal && periodVal !== "all" && periodVal !== "custom") {
+                if (!normDate) return false;
+                const pDate = new Date(normDate + "T00:00:00");
                 if (isNaN(pDate.getTime())) return false;
                 const now = new Date();
+                now.setHours(23, 59, 59, 999);
                 const diffDays = (now - pDate) / (1000 * 60 * 60 * 24);
                 if (periodVal === "daily" && diffDays > 1.5) return false;
                 if (periodVal === "weekly" && diffDays > 7.5) return false;
-                if (periodVal === "monthly" && diffDays > 30.5) return false;
+                if (periodVal === "monthly" && diffDays > 31) return false;
             }
             return true;
         }
@@ -2483,6 +2491,131 @@
                 .replace(/"/g, "&quot;");
         }
 
+        // Normalize any date value from Google Sheet / local into YYYY-MM-DD
+        function normalizeDateValue(val) {
+            if (val === null || val === undefined || val === "") return "";
+            if (val instanceof Date && !isNaN(val.getTime())) return toISODate(val);
+            let s = String(val).trim();
+            // Already ISO
+            if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+            // DD/MM/YYYY or DD-MM-YYYY
+            let m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+            if (m) {
+                const d = m[1].padStart(2, "0");
+                const mo = m[2].padStart(2, "0");
+                return `${m[3]}-${mo}-${d}`;
+            }
+            // MM/DD/YYYY
+            m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+            if (m) {
+                // Prefer DMY for Lanka; if first > 12 treat as day
+                let day = m[1], month = m[2];
+                if (parseInt(m[1], 10) > 12) { day = m[1]; month = m[2]; }
+                return `${m[3]}-${String(month).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
+            }
+            const parsed = new Date(s);
+            if (!isNaN(parsed.getTime())) return toISODate(parsed);
+            return s;
+        }
+
+        function normalizeDeptName(name) {
+            const s = String(name || "").trim();
+            const lower = s.toLowerCase().replace(/\s+/g, " ");
+            if (lower.includes("05") || lower === "sorting 5") return "Sorting 05";
+            if (lower.includes("06") || lower === "sorting 6") return "Sorting 06";
+            if (lower.includes("07") || lower === "sorting 7") return "Sorting 07";
+            return s;
+        }
+
+        function normalizeShiftName(name) {
+            const s = String(name || "").trim().toLowerCase();
+            if (s.startsWith("morn")) return "Morning";
+            if (s.startsWith("even") || s.startsWith("aft")) return "Evening";
+            if (s.startsWith("night") || s.startsWith("nigh")) return "Night";
+            // already canonical
+            if (s === "morning" || s === "evening" || s === "night") {
+                return s.charAt(0).toUpperCase() + s.slice(1);
+            }
+            return String(name || "").trim();
+        }
+
+        function num(v, fallback = 0) {
+            const n = parseFloat(v);
+            return isNaN(n) ? fallback : n;
+        }
+
+        // Clean every record after loading from cloud / localStorage
+        function normalizeAppData() {
+            if (!appData) return;
+
+            appData.productions = (appData.productions || []).map(p => ({
+                ...p,
+                EntryID: String(p.EntryID || p.entryId || "").trim(),
+                Date: normalizeDateValue(p.Date || p.date),
+                Department: normalizeDeptName(p.Department || p.department),
+                Shift: normalizeShiftName(p.Shift || p.shift),
+                SupervisorEmail: String(p.SupervisorEmail || p.supervisorEmail || "").trim(),
+                LineSpeed: num(p.LineSpeed, 25),
+                TotalSellableSqM: num(p.TotalSellableSqM),
+                TotalCGradeSqM: num(p.TotalCGradeSqM),
+                TotalDamagesSqM: num(p.TotalDamagesSqM),
+                TotalSortedSqM: num(p.TotalSortedSqM),
+                OverallSellableYield: num(p.OverallSellableYield),
+                OverallCGradePct: num(p.OverallCGradePct),
+                OverallDamagePct: num(p.OverallDamagePct)
+            })).filter(p => p.EntryID);
+
+            appData.productionItems = (appData.productionItems || []).map(it => ({
+                ...it,
+                EntryID: String(it.EntryID || "").trim(),
+                TileTypeName: String(it.TileTypeName || "").trim(),
+                SortedPcs: num(it.SortedPcs),
+                SellablePcs: num(it.SellablePcs),
+                CGradePcs: num(it.CGradePcs),
+                DamagePcs: num(it.DamagePcs),
+                BeforeSquaringDamages: num(it.BeforeSquaringDamages),
+                DiagonalDamage: num(it.DiagonalDamage),
+                SizeOutDamages: num(it.SizeOutDamages),
+                SortingDamages: num(it.SortingDamages),
+                SellableSqM: num(it.SellableSqM),
+                CGradeSqM: num(it.CGradeSqM),
+                DamagesSqM: num(it.DamagesSqM),
+                SortedSqM: num(it.SortedSqM)
+            })).filter(it => it.EntryID);
+
+            appData.downtimes = (appData.downtimes || []).map(d => ({
+                ...d,
+                EntryID: String(d.EntryID || "").trim(),
+                MajorCategory: String(d.MajorCategory || "").trim(),
+                SubDowntime: String(d.SubDowntime || "").trim(),
+                DurationMinutes: num(d.DurationMinutes)
+            })).filter(d => d.EntryID);
+
+            appData.tileTypes = (appData.tileTypes || []).map(t => ({
+                ...t,
+                TypeID: String(t.TypeID || "").trim(),
+                TileTypeName: String(t.TileTypeName || "").trim(),
+                SqMetersFactor: num(t.SqMetersFactor, 0.36)
+            })).filter(t => t.TileTypeName);
+
+            appData.downtimeCategories = (appData.downtimeCategories || []).map(c => ({
+                MajorCategory: String(c.MajorCategory || "").trim(),
+                SubDowntime: String(c.SubDowntime || "").trim()
+            })).filter(c => c.MajorCategory && c.SubDowntime);
+
+            appData.users = (appData.users || []).map(u => ({
+                Email: String(u.Email || "").trim(),
+                Name: String(u.Name || "").trim(),
+                Password: String(u.Password || "").trim(),
+                Role: String(u.Role || "Viewer").trim(),
+                Status: String(u.Status || "Active").trim()
+            })).filter(u => u.Email);
+
+            if (!appData.standardLineSpeeds || typeof appData.standardLineSpeeds !== "object") {
+                appData.standardLineSpeeds = { ...DEFAULT_STANDARD_SPEEDS };
+            }
+        }
+
         // ==========================================
         // 9. PRODUCTION & PLANT EFFICIENCY ANALYTICS
         // ==========================================
@@ -2493,9 +2626,9 @@
             const fromDate = document.getElementById("filterDateFromProd")?.value || "";
             const toDate = document.getElementById("filterDateToProd")?.value || "";
 
-            return appData.productions.filter(p => {
-                if (deptFilter !== "all" && p.Department !== deptFilter) return false;
-                if (shiftFilter !== "all" && p.Shift !== shiftFilter) return false;
+            return (appData.productions || []).filter(p => {
+                if (deptFilter !== "all" && normalizeDeptName(p.Department) !== normalizeDeptName(deptFilter)) return false;
+                if (shiftFilter !== "all" && normalizeShiftName(p.Shift) !== normalizeShiftName(shiftFilter)) return false;
                 return matchesDateAndPeriod(p.Date, periodFilter, fromDate, toDate);
             });
         }
@@ -2868,9 +3001,9 @@
             const fromDate = document.getElementById("filterDateFromStop")?.value || "";
             const toDate = document.getElementById("filterDateToStop")?.value || "";
 
-            return appData.productions.filter(p => {
-                if (deptFilter !== "all" && p.Department !== deptFilter) return false;
-                if (shiftFilter !== "all" && p.Shift !== shiftFilter) return false;
+            return (appData.productions || []).filter(p => {
+                if (deptFilter !== "all" && normalizeDeptName(p.Department) !== normalizeDeptName(deptFilter)) return false;
+                if (shiftFilter !== "all" && normalizeShiftName(p.Shift) !== normalizeShiftName(shiftFilter)) return false;
                 return matchesDateAndPeriod(p.Date, periodFilter, fromDate, toDate);
             });
         }
@@ -3898,9 +4031,9 @@
             const toDate = document.getElementById("filterDateToDefect")?.value || "";
             const basis = document.getElementById("defectPctBasis")?.value || "sorted";
 
-            const filteredProds = appData.productions.filter(p => {
-                if (deptFilter !== "all" && p.Department !== deptFilter) return false;
-                if (shiftFilter !== "all" && p.Shift !== shiftFilter) return false;
+            const filteredProds = (appData.productions || []).filter(p => {
+                if (deptFilter !== "all" && normalizeDeptName(p.Department) !== normalizeDeptName(deptFilter)) return false;
+                if (shiftFilter !== "all" && normalizeShiftName(p.Shift) !== normalizeShiftName(shiftFilter)) return false;
                 return matchesDateAndPeriod(p.Date, periodFilter, fromDate, toDate);
             });
 
