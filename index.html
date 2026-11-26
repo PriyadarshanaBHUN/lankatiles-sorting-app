@@ -1368,7 +1368,7 @@
         // ==========================================
         // 1. CONFIGURATION & PERSISTENT STATE KEYS
         // ==========================================
-        const API_URL = "https://script.google.com/macros/s/AKfycbzhMLKcDTb92K2FzBW8-9v2ldGAoN85W71d5oXM2EL72Hl684IOfFuQ-oSQzQefxGCR/exec";
+        const API_URL = "https://script.google.com/macros/s/AKfycbxF57ugVJfno0LG0pCqCLT3I2t5FxCMDjoggLOeK3QDHJ7ToghZRk_bQWFn2nnqgJsY/exec";
         const STORAGE_STATE_KEY = "lankatiles_app_state_v2";
         const STORAGE_QUEUE_KEY = "lankatiles_sync_queue_v2";
         const STORAGE_USER_KEY = "lankatiles_session_user_v2";
@@ -1692,6 +1692,21 @@
             if (updateBadge) updateSyncStatusBadge();
         }
 
+        // Robust POST helper for Google Apps Script (avoids CORS preflight)
+        async function postToAppsScript(payload) {
+            const res = await fetch(API_URL, {
+                method: "POST",
+                headers: { "Content-Type": "text/plain;charset=utf-8" },
+                body: JSON.stringify(payload)
+            });
+            const text = await res.text();
+            try {
+                return JSON.parse(text);
+            } catch (e) {
+                return { status: "error", message: "Invalid JSON from server", raw: text };
+            }
+        }
+
         function enqueueSyncTask(taskType, payload) {
             syncQueue.push({
                 id: "SYNC_" + Date.now() + "_" + Math.floor(Math.random() * 10000),
@@ -1716,6 +1731,8 @@
             }
             if (syncQueue.length === 0) {
                 updateSyncStatusBadge();
+                // Still pull latest even if nothing to push
+                await syncRemoteDataQuietly(false);
                 return;
             }
 
@@ -1725,18 +1742,18 @@
             if (text) text.innerText = `Syncing (${syncQueue.length})...`;
 
             const remaining = [];
-            for (const item of syncQueue) {
+            for (const item of [...syncQueue]) {
                 try {
-                    await fetch(API_URL, {
-                        method: "POST",
-                        mode: "no-cors",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            action: item.taskType,
-                            data: item.payload
-                        })
+                    const result = await postToAppsScript({
+                        action: item.taskType,
+                        data: item.payload
                     });
+                    if (!result || result.status !== "success") {
+                        console.warn("Sync item failed:", item.taskType, result);
+                        remaining.push(item);
+                    }
                 } catch (e) {
+                    console.warn("Sync network error:", e);
                     remaining.push(item);
                 }
             }
@@ -1746,6 +1763,9 @@
                 localStorage.setItem(STORAGE_QUEUE_KEY, JSON.stringify(syncQueue));
             } catch (e) {}
             updateSyncStatusBadge();
+
+            // Always pull after push so all devices stay aligned
+            await syncRemoteDataQuietly(true);
         }
 
         function updateSyncStatusBadge() {
@@ -1979,7 +1999,26 @@
             errEl.classList.add("hidden");
         }
 
-        function handleLogin(e) {
+        async function fetchUsersFromCloud() {
+            try {
+                const res = await fetch(`${API_URL}?action=getAppData&_=${Date.now()}`);
+                const data = await res.json();
+                if (data && data.status === "success" && Array.isArray(data.users) && data.users.length > 0) {
+                    appData.users = data.users;
+                    // Also pull other master data early
+                    if (Array.isArray(data.tileTypes) && data.tileTypes.length > 0) appData.tileTypes = data.tileTypes;
+                    if (Array.isArray(data.downtimeCategories) && data.downtimeCategories.length > 0) appData.downtimeCategories = data.downtimeCategories;
+                    if (data.standardLineSpeeds) appData.standardLineSpeeds = { ...DEFAULT_STANDARD_SPEEDS, ...data.standardLineSpeeds };
+                    persistLocalState(false);
+                    return true;
+                }
+            } catch (e) {
+                console.warn("Could not fetch users from cloud:", e);
+            }
+            return false;
+        }
+
+        async function handleLogin(e) {
             e.preventDefault();
             clearLoginError();
 
@@ -1991,23 +2030,41 @@
                 return;
             }
 
+            // Always try to refresh users from Google Sheet before checking password
+            const submitBtn = e.target.querySelector('button[type="submit"]');
+            const oldBtnText = submitBtn ? submitBtn.innerText : "";
+            if (submitBtn) {
+                submitBtn.disabled = true;
+                submitBtn.innerText = "Checking credentials...";
+            }
+
+            if (navigator.onLine) {
+                await fetchUsersFromCloud();
+            }
+
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                submitBtn.innerText = oldBtnText || "Authenticate Securely";
+            }
+
             const foundUser = appData.users.find(u => (u.Email || "").trim().toLowerCase() === emailInput);
 
             if (!foundUser) {
-                showLoginError("Invalid corporate email or password.");
-                recordActivityLog("Security", "Failed Login Attempt", `Unknown email tried to sign in: ${emailInput}`, { email: emailInput, role: "Unknown" });
+                showLoginError("Invalid corporate email or password. (User not found in cloud or local list)");
                 return;
             }
 
             if ((foundUser.Status || "Active") !== "Active") {
                 showLoginError("This account is Inactive. Contact the System Owner.");
-                recordActivityLog("Security", "Inactive Account Login Blocked", `Inactive account sign-in attempt: ${foundUser.Email}`, { email: foundUser.Email, role: foundUser.Role });
                 return;
             }
 
-            if (foundUser.Password !== passwordInput) {
+            // Compare password (trim both sides to avoid space issues)
+            const storedPass = String(foundUser.Password || "").trim();
+            const typedPass = String(passwordInput || "").trim();
+
+            if (storedPass !== typedPass) {
                 showLoginError("Invalid corporate email or password.");
-                recordActivityLog("Security", "Failed Password Attempt", `Wrong password for ${foundUser.Email}`, { email: foundUser.Email, role: foundUser.Role });
                 return;
             }
 
@@ -2132,33 +2189,59 @@
             finalizeAppInit();
 
             if (navigator.onLine) {
-                flushSyncQueue();
-                syncRemoteDataQuietly();
+                flushSyncQueue().then(() => syncRemoteDataQuietly(false));
+            }
+
+            // Auto-sync every 90 seconds while the app is open
+            if (!window._ltSyncTimer) {
+                window._ltSyncTimer = setInterval(() => {
+                    if (navigator.onLine && currentUser) {
+                        flushSyncQueue();
+                    }
+                }, 90000);
+            }
+            // Sync when tab becomes visible again
+            if (!window._ltVisHandler) {
+                window._ltVisHandler = () => {
+                    if (document.visibilityState === "visible" && navigator.onLine && currentUser) {
+                        flushSyncQueue();
+                    }
+                };
+                document.addEventListener("visibilitychange", window._ltVisHandler);
             }
         }
 
-        function syncRemoteDataQuietly() {
-            fetch(`${API_URL}?action=getAppData`)
-                .then(res => res.json())
-                .then(data => {
-                    if (data && data.status === "success") {
-                        if (Array.isArray(data.productions) && data.productions.length > 0 && appData.productions.length === 0) {
-                            appData.productions = data.productions;
-                        }
-                        if (Array.isArray(data.productionItems) && data.productionItems.length > 0 && appData.productionItems.length === 0) {
-                            appData.productionItems = data.productionItems;
-                        }
-                        if (Array.isArray(data.downtimes) && data.downtimes.length > 0 && appData.downtimes.length === 0) {
-                            appData.downtimes = data.downtimes;
-                        }
-                        if (Array.isArray(data.tileTypes) && data.tileTypes.length > 0) {
-                            appData.tileTypes = data.tileTypes;
-                        }
-                        persistLocalState();
-                        finalizeAppInit();
-                    }
-                })
-                .catch(() => {});
+        async function syncRemoteDataQuietly(showOkToast = false) {
+            if (!navigator.onLine) return;
+            try {
+                const res = await fetch(`${API_URL}?action=getAppData&_=${Date.now()}`);
+                const data = await res.json();
+                if (!data || data.status !== "success") {
+                    console.warn("getAppData failed", data);
+                    return;
+                }
+
+                // Server is source of truth for shared operational data
+                if (Array.isArray(data.productions))      appData.productions      = data.productions;
+                if (Array.isArray(data.productionItems))  appData.productionItems  = data.productionItems;
+                if (Array.isArray(data.downtimes))        appData.downtimes        = data.downtimes;
+                if (Array.isArray(data.tileTypes) && data.tileTypes.length > 0)
+                    appData.tileTypes = data.tileTypes;
+                if (Array.isArray(data.downtimeCategories) && data.downtimeCategories.length > 0)
+                    appData.downtimeCategories = data.downtimeCategories;
+                if (Array.isArray(data.users) && data.users.length > 0)
+                    appData.users = data.users;
+                if (data.standardLineSpeeds && typeof data.standardLineSpeeds === "object")
+                    appData.standardLineSpeeds = { ...DEFAULT_STANDARD_SPEEDS, ...data.standardLineSpeeds };
+                if (Array.isArray(data.activityLogs))
+                    appData.activityLogs = data.activityLogs;
+
+                persistLocalState();
+                if (typeof finalizeAppInit === "function") finalizeAppInit();
+                if (showOkToast) showToast("Synced with cloud database", "success");
+            } catch (e) {
+                console.warn("Pull from cloud failed:", e);
+            }
         }
 
         // ==========================================
@@ -4345,6 +4428,13 @@
                     }
                 }
             } catch (e) {}
+
+            // Pre-load users from Google Sheet while login screen is visible
+            if (!currentUser && navigator.onLine) {
+                fetchUsersFromCloud().then(ok => {
+                    if (ok) console.log("Users loaded from cloud for login");
+                });
+            }
         };
     </script>
 </body>
