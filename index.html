@@ -1411,6 +1411,7 @@
         let currentUser = null;
         let appData = cloneSeedData();
         let syncQueue = [];
+        let isSyncing = false;
         let deferredPwaPrompt = null;
 
         // Chart Instances
@@ -1731,43 +1732,64 @@
                 showToast("You are offline. Changes are saved locally and will sync automatically.", "warning");
                 return;
             }
+            if (isSyncing) return;
             if (syncQueue.length === 0) {
                 updateSyncStatusBadge();
-                // Still pull latest even if nothing to push
                 await syncRemoteDataQuietly(false);
                 return;
             }
 
-            const dot = document.getElementById("syncStatusDot");
-            const text = document.getElementById("syncStatusText");
-            if (dot) dot.className = "w-2 h-2 rounded-full bg-amber-400 animate-ping";
-            if (text) text.innerText = `Syncing (${syncQueue.length})...`;
+            isSyncing = true;
+            try {
+                const dot = document.getElementById("syncStatusDot");
+                const textEl = document.getElementById("syncStatusText");
+                if (dot) dot.className = "w-2 h-2 rounded-full bg-amber-400 animate-ping";
+                if (textEl) textEl.innerText = `Syncing (${syncQueue.length})...`;
 
-            const remaining = [];
-            for (const item of [...syncQueue]) {
+                // Deduplicate queue (same action + same payload only once)
+                const seen = new Set();
+                const uniqueQueue = [];
+                for (const item of syncQueue) {
+                    const key = item.taskType + "::" + JSON.stringify(item.payload);
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    uniqueQueue.push(item);
+                }
+
+                const working = uniqueQueue;
+                syncQueue = [];
                 try {
-                    const result = await postToAppsScript({
-                        action: item.taskType,
-                        data: item.payload
-                    });
-                    if (!result || result.status !== "success") {
-                        console.warn("Sync item failed:", item.taskType, result);
+                    localStorage.setItem(STORAGE_QUEUE_KEY, JSON.stringify(syncQueue));
+                } catch (e) {}
+
+                const remaining = [];
+                for (const item of working) {
+                    try {
+                        const result = await postToAppsScript({
+                            action: item.taskType,
+                            data: item.payload
+                        });
+                        if (!result || result.status !== "success") {
+                            console.warn("Sync item failed:", item.taskType, result);
+                            remaining.push(item);
+                        }
+                    } catch (e) {
+                        console.warn("Sync network error:", e);
                         remaining.push(item);
                     }
-                } catch (e) {
-                    console.warn("Sync network error:", e);
-                    remaining.push(item);
                 }
+
+                if (remaining.length) {
+                    syncQueue = remaining.concat(syncQueue);
+                    try {
+                        localStorage.setItem(STORAGE_QUEUE_KEY, JSON.stringify(syncQueue));
+                    } catch (e) {}
+                }
+                updateSyncStatusBadge();
+                await syncRemoteDataQuietly(true);
+            } finally {
+                isSyncing = false;
             }
-
-            syncQueue = remaining;
-            try {
-                localStorage.setItem(STORAGE_QUEUE_KEY, JSON.stringify(syncQueue));
-            } catch (e) {}
-            updateSyncStatusBadge();
-
-            // Always pull after push so all devices stay aligned
-            await syncRemoteDataQuietly(true);
         }
 
         function updateSyncStatusBadge() {
@@ -4353,6 +4375,13 @@
                 showToast("Enter a valid tile type name and positive SqM factor.", "warning");
                 return;
             }
+            const already = (appData.tileTypes || []).some(
+                t => String(t.TileTypeName || "").trim().toLowerCase() === tileTypeName.toLowerCase()
+            );
+            if (already) {
+                showToast("This tile type already exists.", "warning");
+                return;
+            }
             const newType = {
                 TypeID: "TT_" + Date.now(),
                 TileTypeName: tileTypeName,
@@ -4367,6 +4396,7 @@
             document.getElementById("admTileFactor").value = "";
             renderAdminTables();
             populateFilterTileTypes();
+            populateDefectFilterTileTypes();
             showToast("Tile type added!", "success");
         }
 
