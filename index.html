@@ -3985,7 +3985,7 @@
             }
             appData.downtimeCategories.push({ MajorCategory: majorCategory, SubDowntime: subDowntime });
             persistLocalState();
-            enqueueSyncTask("stoppageCategoryAdd", { majorCategory, subDowntime });
+            enqueueSyncTask("stoppageCategoryAdd", {majorCategory,subDowntime,createdBy: currentUser.email});
             recordActivityLog("Admin", "Added Stoppage Machine/Category", `${majorCategory} > ${subDowntime}`);
 
             document.getElementById("admStoppageMajor").value = "";
