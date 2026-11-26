@@ -3975,16 +3975,24 @@
         }
 
         function deleteStoppageCategory(index) {
-            if (!currentUser || currentUser.role !== "Owner") return;
+            if (!currentUser || currentUser.role !== "Owner") {
+                showToast("Only Owner can delete stoppage categories.", "error");
+                return;
+            }
             const removed = appData.downtimeCategories[index];
             appData.downtimeCategories.splice(index, 1);
             persistLocalState();
             if (removed) {
+                enqueueSyncTask("stoppageCategoryDelete", {
+                    MajorCategory: removed.MajorCategory,
+                    SubDowntime: removed.SubDowntime
+                });
                 recordActivityLog("Admin", "Removed Stoppage Machine/Category", `${removed.MajorCategory} > ${removed.SubDowntime}`);
             }
             renderAdminTables();
             populateStoppageMajorFilter();
             renderStoppagesAnalytics();
+            showToast("Stoppage category deleted and queued for cloud sync.", "success");
         }
 
         // ==========================================
@@ -4363,15 +4371,24 @@
         }
 
         function deleteTileType(typeId) {
-            if (!currentUser || currentUser.role !== "Owner") return;
+            if (!currentUser || currentUser.role !== "Owner") {
+                showToast("Only Owner can delete tile types.", "error");
+                return;
+            }
             const target = appData.tileTypes.find(t => t.TypeID === typeId);
             appData.tileTypes = appData.tileTypes.filter(t => t.TypeID !== typeId);
             persistLocalState();
+            enqueueSyncTask("tileTypeDelete", {
+                TypeID: typeId,
+                TileTypeName: target ? target.TileTypeName : ""
+            });
             if (target) {
                 recordActivityLog("Admin", "Deleted Tile Type", `${target.TileTypeName} (${typeId})`);
             }
             renderAdminTables();
             populateFilterTileTypes();
+            populateDefectFilterTileTypes();
+            showToast("Tile type deleted and queued for cloud sync.", "success");
         }
 
         function renderAdminTables() {
